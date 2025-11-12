@@ -114,105 +114,80 @@ class DPOSelfPlayGenerator:
         move_numbers=move_numbers,
     )
 
-  def create_preferences(
-      self, trajectories: list[GameTrajectory]
-  ) -> list[PreferencePair]:
-    """Analyzes game trajectories and creates preference pairs.
-
-    For each position in the trajectories:
-    1. Get Stockfish's best move and evaluation
-    2. Evaluate the model's move
-    3. If the model made a mistake (eval_diff > threshold), create a preference pair
-
-    Args:
-      trajectories: List of game trajectories to analyze.
-
-    Returns:
-      List of preference pairs where the model made mistakes.
-    """
+  def create_preferences(self, trajectories: list[GameTrajectory]) -> list[PreferencePair]:
     preferences = []
+
+    def _pov_pawns(pov_score) -> float:
+      # pov_score is chess.engine.PovScore (already "relative")
+      if pov_score.is_mate():
+        m = pov_score.mate()
+        return 100.0 if m > 0 else -100.0
+      return pov_score.score() / 100.0  # centipawns -> pawns
 
     for traj_idx, trajectory in enumerate(trajectories):
       print(f'Analyzing trajectory {traj_idx + 1}/{len(trajectories)}...')
 
       for pos_idx, (fen, llm_move) in enumerate(zip(trajectory.positions, trajectory.moves)):
         board = chess.Board(fen)
+        initial_turn = board.turn  # True=White, False=Black
 
+        # Parse / check LLM move legality
         try:
           llm_move_obj = chess.Move.from_uci(llm_move)
         except ValueError:
           continue
-
         if llm_move_obj not in board.legal_moves:
           continue
 
-        # Get Stockfish's preferred move and evaluation
-        sf_result = self.stockfish_engine.analyse(board)
-        sf_score = sf_result['score'].relative
-
-        # Handle mate scores
-        if sf_score.is_mate():
-          mate_in = sf_score.mate()
-          sf_eval = 100.0 if mate_in > 0 else -100.0
-        else:
-          sf_eval = sf_score.score() / 100.0
-
-        # Skip if position is already decided (too winning or losing)
-        if abs(sf_eval) > self.max_position_eval:
+        # 1) Get SF best move (from current position)
+        sf_top = self.stockfish_engine.analyse(board)
+        if 'pv' not in sf_top or not sf_top['pv']:
           continue
+        sf_move = sf_top['pv'][0]
 
-        # Get Stockfish's best move
-        if 'pv' in sf_result and len(sf_result['pv']) > 0:
-          sf_move = sf_result['pv'][0]
-        else:
-          continue
-
-        # Skip if model already played Stockfish's move
-        if llm_move_obj == sf_move:
-          continue
-
-        # Evaluate the model's move
-        board.push(llm_move_obj)
-        llm_result = self.stockfish_engine.analyse(board)
-        llm_score = llm_result['score'].relative
-
-        if llm_score.is_mate():
-          mate_in = llm_score.mate()
-          # Note: This is from opponent's perspective, so flip sign
-          llm_eval = -100.0 if mate_in > 0 else 100.0
-        else:
-          # Flip sign because it's from opponent's perspective
-          llm_eval = -llm_score.score() / 100.0
-
+        # 2) Evaluate AFTER SF move (opponent to move)
+        board.push(sf_move)
+        sf_after_rel = self.stockfish_engine.analyse(board)['score'].relative
         board.pop()
 
-        # Calculate evaluation difference
-        eval_diff = sf_eval - llm_eval
+        # 3) Evaluate AFTER LLM move (opponent to move)
+        if llm_move_obj not in board.legal_moves:
+          continue
+        board.push(llm_move_obj)
+        llm_after_rel = self.stockfish_engine.analyse(board)['score'].relative
+        board.pop()
 
-        # Only create preference pair if significant mistake
+        # 4) Map both to the INITIAL side-to-move perspective
+        # After any legal move, board.turn flips, so both are opponent POV -> negate both.
+        sf_eval_initial  = -_pov_pawns(sf_after_rel)
+        llm_eval_initial = -_pov_pawns(llm_after_rel)
+
+        # Optional: drop trivially won/lost positions
+        if (abs(sf_eval_initial) > self.max_position_eval or
+            abs(llm_eval_initial) > self.max_position_eval):
+          continue
+
+        eval_diff = sf_eval_initial - llm_eval_initial
         if eval_diff < self.eval_threshold:
           continue
 
-        # Create preference pair
+        # Build preference (chosen=SF, rejected=LLM)
         tokenized_pos = tokenizer.tokenize(fen)
-
         try:
-          sf_action = utils.MOVE_TO_ACTION[sf_move.uci()]
+          sf_action  = utils.MOVE_TO_ACTION[sf_move.uci()]
           llm_action = utils.MOVE_TO_ACTION[llm_move]
         except KeyError:
           continue
 
-        preferences.append(
-            PreferencePair(
-                position=fen,
-                tokenized_position=tokenized_pos,
-                chosen_move=sf_move.uci(),
-                rejected_move=llm_move,
-                chosen_action=sf_action,
-                rejected_action=llm_action,
-                eval_margin=eval_diff,
-            )
-        )
+        preferences.append(PreferencePair(
+            position=fen,
+            tokenized_position=tokenized_pos,
+            chosen_move=sf_move.uci(),
+            rejected_move=llm_move,
+            chosen_action=sf_action,
+            rejected_action=llm_action,
+            eval_margin=eval_diff,
+        ))
 
     return preferences
 
@@ -229,7 +204,7 @@ class DPOSelfPlayGenerator:
       Tuple of (positions, chosen_moves, rejected_moves) where:
         - positions: [batch_size, seq_len] tokenized positions
         - chosen_moves: [batch_size] action indices for Stockfish moves
-        - rejected_moves: [batch_size] action indices for model moves
+        - rejected_moves: [batch_size] action indices for model movesS
     """
     # Generate games
     trajectories = []
@@ -293,4 +268,7 @@ class DPOSelfPlayGenerator:
 
   def close(self):
     """Closes the Stockfish engine."""
-    pass
+    try:
+      self.stockfish_engine.close()
+    except Exception:
+      pass
