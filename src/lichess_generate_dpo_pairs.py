@@ -2,6 +2,7 @@ import json
 import logging
 import os
 
+import debugpy
 import numpy as np
 from jax import random as jrandom
 
@@ -72,8 +73,8 @@ def generate_dpo_pairs(
       logging.info(f'Will skip these positions when generating new pairs')
 
   # Check if we already have enough pairs
-  if max_pairs.value > 0 and len(all_positions) >= max_pairs.value:
-    logging.info(f'\n=== Already have {len(all_positions):,} pairs (max: {max_pairs.value:,}) ===')
+  if max_pairs > 0 and len(all_positions) >= max_pairs:
+    logging.info(f'\n=== Already have {len(all_positions):,} pairs (max: {max_pairs:,}) ===')
     cache_complete = True
 
   # Generate pairs if cache is not complete
@@ -84,9 +85,9 @@ def generate_dpo_pairs(
       logging.info(f'This will be saved to: {cache_file}\n')
 
     # Check if we need to generate more pairs
-    if max_pairs.value > 0:
-      pairs_needed = max_pairs.value - len(all_positions)
-      logging.info(f'Need {pairs_needed:,} more pairs to reach {max_pairs.value:,}')
+    if max_pairs > 0:
+      pairs_needed = max_pairs - len(all_positions)
+      logging.info(f'Need {pairs_needed:,} more pairs to reach {max_pairs:,}')
 
     # Build predict function for generator
     _, return_buckets_values = utils.get_uniform_buckets_edges_values(128)
@@ -99,7 +100,7 @@ def generate_dpo_pairs(
     # Initialize generator
     generator = lichess_dpo_generator.LichessDPOGenerator(
         predict_fn=predict_fn,
-        database_path=lichess_db_path.value,
+        database_path=lichess_db_path,
     )
 
     # Open cache file in append mode
@@ -142,8 +143,8 @@ def generate_dpo_pairs(
           new_pairs_added += 1
 
           # Check if we've reached the max pairs limit
-          if max_pairs.value > 0 and pair_count >= max_pairs.value:
-            logging.info(f'Reached max pairs limit: {max_pairs.value:,}')
+          if max_pairs > 0 and pair_count >= max_pairs:
+            logging.info(f'Reached max pairs limit: {max_pairs:,}')
             break
 
         # Flush cache file and update metadata periodically
@@ -153,7 +154,7 @@ def generate_dpo_pairs(
 
           # Update metadata
           metadata = {
-              'model': base_model.value,
+              'model': base_model,
               'num_pairs': pair_count,
               'complete': False,
           }
@@ -166,7 +167,7 @@ def generate_dpo_pairs(
           logging.info(f'Generated {pair_count:,} pairs ({new_pairs_added:,} new, {skipped_duplicates:,} skipped)...')
 
         # Break outer loop if we've reached max pairs
-        if max_pairs.value > 0 and pair_count >= max_pairs.value:
+        if max_pairs > 0 and pair_count >= max_pairs:
           break
 
       logging.info(f'\nGeneration complete!')
@@ -180,7 +181,7 @@ def generate_dpo_pairs(
     # Mark cache as complete
     logging.info('Marking cache as complete...')
     metadata = {
-        'model': base_model.value,
+        'model': base_model,
         'num_pairs': len(all_positions),
         'complete': True,
     }
@@ -192,6 +193,9 @@ def generate_dpo_pairs(
     return all_positions, all_chosen, all_rejected
 
 if __name__ == '__main__':
+    debugpy.listen(5678)
+    debugpy.wait_for_client()
+    
     num_layers, embedding_dim, num_heads = 8, 256, 8 #Assume configuration for 9M
     base_model = '9M'
     max_pairs = -1
@@ -219,13 +223,17 @@ if __name__ == '__main__':
     initial_params = predictor.initial_params(rng=rng, targets=dummy_targets)
     
     base_checkpoint_dir = os.path.join(os.getcwd(), f'../checkpoints/{base_model}')
-    checkpoint_dir = os.path.join(os.getcwd(), f'../checkpoints/{base_model}_lichess')    
     
+    #Load base model
     params = training_utils.load_parameters(
         checkpoint_dir=base_checkpoint_dir,
         params=initial_params,
         step=-1,
     )
+    
+    checkpoint_dir = os.path.join(os.getcwd(), f'../checkpoints/{base_model}_lichess') 
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
     params_ema = params    
             
     generate_dpo_pairs(
