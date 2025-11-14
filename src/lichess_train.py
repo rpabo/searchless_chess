@@ -12,6 +12,7 @@ import warnings
 
 from absl import app
 from absl import flags
+import debugpy
 from jax import random as jrandom
 import jax
 import jax.numpy as jnp
@@ -530,4 +531,6 @@ def main(argv):
 
 
 if __name__ == '__main__':
+  debugpy.listen(5678)
+  debugpy.wait_for_client()
   app.run(main)
