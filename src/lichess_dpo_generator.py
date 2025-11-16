@@ -38,7 +38,7 @@ class LichessDPOGenerator:
   def __init__(self, 
                predict_fn, 
                database_path: str, 
-               cp_margin: int = 200,
+               cp_margin: int = 150,
                ):
     """Initialize generator.
 
@@ -255,7 +255,7 @@ class LichessDPOGenerator:
       positions_per_batch: int,
       batch_size: int,
       target_pairs: int,
-  ) -> Iterator[tuple[list, list, list, dict]]:
+  ) -> Iterator[tuple[list, list, list, list, dict]]:
     """Generate preference pairs in streaming batches (memory-efficient).
 
     Args:
@@ -334,11 +334,6 @@ class LichessDPOGenerator:
                 
         best_index = np.argmax(win_probs)
         model_win_prob = win_probs[best_index]
-
-        # Only create preference pair if model's move is NOT in any PV
-        # best_first_move = best_line[0]  # First move of best PV
-        # diff_cp = self.find_move_cp(position_data['evals'], best_first_move - \
-        #   self.find_move_cp(position_data['evals'], model_move.uci()))
                 
         if model_move_uci not in acceptable_first_moves:
           # NEW: try to get cp for model's move from evals
@@ -415,7 +410,7 @@ class LichessDPOGenerator:
       preferences: list[PreferencePair],
       batch_size: int,      
       stats: Optional[dict] = None
-  ) -> tuple[list, list, list, dict]:
+  ) -> tuple[list, list, list, list, dict]:
     """Convert preferences to training format."""
     positions_list = []
     chosen_moves_list = []

@@ -90,7 +90,7 @@ _CHECKPOINT_EVERY = flags.DEFINE_integer(
 
 _MAX_PAIRS = flags.DEFINE_integer(
     'max_pairs',
-    -1,
+    0,
     'Maximum number of DPO pairs to generate (-1 = unlimited).',
 )
 
@@ -106,6 +106,7 @@ def dpo_loss_fn(
     predictor,
     beta,
     temperature,
+    cp_diffs=None #NEW
 ):
   """DPO loss function for action-value models."""
   batch_size = len(chosen_moves)
@@ -114,7 +115,7 @@ def dpo_loss_fn(
   dummy_returns = jnp.zeros((batch_size, 1), dtype=jnp.int32)
   chosen_actions = chosen_moves[:, None]
   rejected_actions = rejected_moves[:, None]
-
+  
   chosen_sequences = jnp.concatenate([positions, chosen_actions, dummy_returns], axis=1)
   rejected_sequences = jnp.concatenate([positions, rejected_actions, dummy_returns], axis=1)
 
@@ -123,7 +124,7 @@ def dpo_loss_fn(
   rejected_return_logprobs = predictor.predict(params=params, targets=rejected_sequences, rng=None)[:, -1]
   ref_chosen_return_logprobs = predictor.predict(params=reference_params, targets=chosen_sequences, rng=None)[:, -1]
   ref_rejected_return_logprobs = predictor.predict(params=reference_params, targets=rejected_sequences, rng=None)[:, -1]
-
+  
   # Convert to Q-values
   _, return_buckets_values = utils.get_uniform_buckets_edges_values(128)
   return_values = jnp.array(return_buckets_values, dtype=jnp.float32)
@@ -148,7 +149,26 @@ def dpo_loss_fn(
   pi_logratios = chosen_logit - rejected_logit
   ref_logratios = ref_chosen_logit - ref_rejected_logit
   logits = beta * (pi_logratios - ref_logratios)
-  loss = -jnp.mean(jax.nn.log_sigmoid(logits))
+
+  if cp_diffs is not None:
+    cp_diffs = jnp.asarray(cp_diffs, dtype=jnp.float32)
+
+    # Example: map cp margin to a weight in [w_min, w_max]
+    # so that very small margins get down-weighted, big margins emphasized.
+    # Tune cp_scale / bounds as needed.
+    cp_scale = 200.0   # ~ "good" margin scale in centipawns
+    w_min, w_max = 0.1, 5.0
+
+    raw_weights = cp_diffs / cp_scale
+    weights = jnp.clip(raw_weights, w_min, w_max)
+
+    # Normalize weights so the average is ~1 (keeps global LR behavior stable)
+    weights /= jnp.mean(weights)
+
+    per_example_losses = -jax.nn.log_sigmoid(logits)
+    loss = jnp.mean(weights * per_example_losses)
+  else:
+    loss = -jnp.mean(jax.nn.log_sigmoid(logits))
 
   # Metrics
   accuracy = jnp.mean(pi_logratios > 0)
@@ -162,9 +182,12 @@ def dpo_loss_fn(
       'kl_divergence_mean': jnp.mean(kl_div),
       'kl_divergence_max': jnp.max(kl_div),
   }
+  
+  if cp_diffs is not None:
+    metrics['cp_diff_mean'] = jnp.mean(cp_diffs)
+    metrics['cp_weight_mean'] = jnp.mean(weights)  
 
   return loss, metrics
-
 
 def main(argv):
   if len(argv) > 1:
@@ -243,6 +266,7 @@ def main(argv):
   all_positions = []
   all_chosen = []
   all_rejected = []
+  all_cp_diff = []
   cached_position_hashes = set()  # Track which positions we've already cached
   cache_complete = False
 
@@ -264,6 +288,7 @@ def main(argv):
           all_positions.append(pos_array)
           all_chosen.append(pair['chosen'])
           all_rejected.append(pair['rejected'])
+          all_cp_diff.append(pair['cp_diff'])
           cached_position_hashes.add(tuple(pair['position']))
 
       logging.info(f'Loaded {len(all_positions):,} cached DPO pairs')
@@ -281,6 +306,7 @@ def main(argv):
           all_positions.append(pos_array)
           all_chosen.append(pair['chosen'])
           all_rejected.append(pair['rejected'])
+          all_cp_diff.append(pair['cp_diff'])      
           cached_position_hashes.add(tuple(pair['position']))
 
       logging.info(f'Loaded {len(all_positions):,} existing pairs')
@@ -323,16 +349,16 @@ def main(argv):
     pair_count = len(all_positions)  # Start from existing count
     new_pairs_added = 0
     skipped_duplicates = 0
-    save_interval = 100000  # Save metadata every 100,000 pairs
+    save_interval = 1000  # Save metadata every 100,000 pairs
     last_save_count = pair_count
 
     try:
-      for positions_batch, chosen_batch, rejected_batch, stats in generator.generate_streaming_batches(
+      for positions_batch, chosen_batch, rejected_batch, cp_diff, stats in generator.generate_streaming_batches(
           positions_per_batch=10000,
           batch_size=32,
-          target_pairs=1000000000,
+          target_pairs=0,
       ):
-        for pos, chosen, rejected in zip(positions_batch, chosen_batch, rejected_batch):
+        for pos, chosen, rejected, cp_diff in zip(positions_batch, chosen_batch, cp_diff):
           pos_hash = tuple(pos.tolist())
 
           # Skip if already cached
@@ -344,6 +370,7 @@ def main(argv):
           all_positions.append(pos)
           all_chosen.append(chosen)
           all_rejected.append(rejected)
+          all_cp_diff.append(cp_diff)
           cached_position_hashes.add(pos_hash)
 
           # Write to cache file immediately (JSONL format)
@@ -351,6 +378,7 @@ def main(argv):
               'position': pos.tolist(),
               'chosen': chosen,
               'rejected': rejected,
+              'cp_diff': cp_diff
           }
           cache_handle.write(json.dumps(pair_data) + '\n')
           pair_count += 1
@@ -409,10 +437,10 @@ def main(argv):
   logging.info(f'Training on {len(all_positions):,} DPO pairs...\n')
 
   @jax.jit
-  def update_step(params, params_ema, ref_params, opt_state, pos, chosen, rejected):
+  def update_step(params, params_ema, ref_params, opt_state, pos, chosen, rejected, cp_diffs):
     def loss_fn(p):
       return dpo_loss_fn(p, ref_params, pos, chosen, rejected, predictor,
-                        _BETA.value, _TEMPERATURE.value)
+                        _BETA.value, _TEMPERATURE.value, cp_diffs=cp_diffs)
 
     (loss_val, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
     grad_norm = optax.global_norm(grads)
@@ -445,6 +473,7 @@ def main(argv):
     positions_batch = [all_positions[i] for i in batch_indices]
     chosen_batch = [all_chosen[i] for i in batch_indices]
     rejected_batch = [all_rejected[i] for i in batch_indices]
+    cp_diff_batch = [all_cp_diff[i] for i in batch_indices] #Added entry
 
     # Pad sequences
     max_len = max(len(seq) for seq in positions_batch)
@@ -454,11 +483,15 @@ def main(argv):
 
     chosen_moves = np.array(chosen_batch, dtype=np.int32)
     rejected_moves = np.array(rejected_batch, dtype=np.int32)
+    cp_diffs = np.array(cp_diff_batch, dtype=np.float32)
 
     # Update
     params, params_ema, opt_state, loss_val, grad_norm, metrics = update_step(
         params, params_ema, reference_params, opt_state,
-        jnp.array(positions), jnp.array(chosen_moves), jnp.array(rejected_moves)
+        jnp.array(positions), 
+        jnp.array(chosen_moves), 
+        jnp.array(rejected_moves),
+        jnp.array(cp_diffs)
     )
 
     total_loss += float(loss_val)

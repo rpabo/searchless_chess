@@ -112,14 +112,14 @@ def generate_dpo_pairs(
     pair_count = len(all_positions)  # Start from existing count
     new_pairs_added = 0
     skipped_duplicates = 0
-    save_interval = 100_000  # Save metadata every 100,000 pairs
+    save_interval = 100  # Save metadata every 1000 pairs
     last_save_count = pair_count
 
     try:
       for positions_batch, chosen_batch, rejected_batch, cp_diff, stats in generator.generate_streaming_batches(
           positions_per_batch=10000,
           batch_size=32,
-          target_pairs=1000,
+          target_pairs=3500,
       ):
         for pos, chosen, rejected, cp_diff in zip(positions_batch, chosen_batch, rejected_batch, cp_diff):
           pos_hash = tuple(pos.tolist())
@@ -203,7 +203,7 @@ if __name__ == '__main__':
     
     num_layers, embedding_dim, num_heads = 8, 256, 8 #Assume configuration for 9M
     base_model = '9M'
-    max_pairs = 100 #Set to a small value for debugging purposes.
+    max_pairs = 4000 #Set to a small value for debugging purposes.
     lichess_db_path = '../data/lichess_db_eval.jsonl.zst'    
     
     #Setup predictor
