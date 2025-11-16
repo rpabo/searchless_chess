@@ -17,20 +17,29 @@ import zstandard as zstd
 from searchless_chess.src import tokenizer
 from searchless_chess.src import utils
 
-
 class PreferencePair:
   """A preference pair for DPO training."""
-  def __init__(self, position: str, chosen_move: str, rejected_move: str, cp_diff: float):
+  def __init__(
+      self, 
+      position: str, 
+      chosen_move: str, 
+      rejected_move: str, 
+      cp_diff: float      
+    ):
+    
     self.position = position
     self.chosen_move = chosen_move
     self.rejected_move = rejected_move
-    self.cp_diff = cp_diff
-
-
+    self.cp_diff = cp_diff    
+    
 class LichessDPOGenerator:
   """Generates DPO preference pairs from Lichess evaluation database."""
 
-  def __init__(self, predict_fn, database_path: str):
+  def __init__(self, 
+               predict_fn, 
+               database_path: str, 
+               cp_margin: int = 200,
+               ):
     """Initialize generator.
 
     Args:
@@ -39,6 +48,17 @@ class LichessDPOGenerator:
     """
     self.predict_fn = predict_fn
     self.database_path = database_path
+    self.cp_margin = cp_margin
+    
+  def _cp_margin_for_side(self, best_cp: float, model_cp: float, board: chess.Board) -> float:
+    """Return cp margin where positive means engine-best is better for side to move."""
+    if board.turn == chess.WHITE:
+      # Higher cp is better for White
+      return best_cp - model_cp
+    else:
+      # Lower cp (more negative) is better for Black, but cp is always from White's POV
+      # Example: best_cp = -30, model_cp = +20 → margin = 20 - (-30) = 50 (engine better)
+      return model_cp - best_cp    
 
   def stream_positions(self, max_positions: Optional[int] = None) -> Iterator[dict]:
     """Stream positions from compressed Lichess database.
@@ -155,7 +175,7 @@ class LichessDPOGenerator:
       board: Chess board position.
 
     Returns:
-      Predicted move.
+      Predicted move, vector containing win probabilities
     """
     # Get legal moves and tokenize actions (same as ActionValueEngine.analyse)
     sorted_legal_moves = list(board.legal_moves)
@@ -189,7 +209,7 @@ class LichessDPOGenerator:
 
     # Return the move with highest win probability
     best_index = np.argmax(win_probs)
-    return sorted_legal_moves[best_index]
+    return sorted_legal_moves[best_index], win_probs
 
   def get_best_line(self, evals: list) -> list[str]:
     """Extract best line (PV) from Lichess evals.
@@ -259,6 +279,7 @@ class LichessDPOGenerator:
       batch_skipped_gameover = 0
       batch_skipped_no_eval = 0
       batch_pairs_from_lines = 0
+      batch_skipped_cp_margin = 0   # NEW: count positions failing cp threshold
 
       for _ in range(positions_per_batch):
         try:
@@ -274,15 +295,18 @@ class LichessDPOGenerator:
         batch_positions_processed += 1
         total_positions_processed += 1
 
-        # Progress logging every 50 positions
-        if batch_positions_processed % 50 == 0:
+        # Progress logging every 1000 positions
+        if batch_positions_processed % 1000 == 0:
           print(f"    Processing position {batch_positions_processed}/{positions_per_batch} "
                 f"({len(batch_preferences)} pairs so far)...")
 
         # Get best line and all acceptable first moves from evaluations
         try:
-          best_line = self.get_best_line(position_data['evals'])
+          # best_line = self.get_best_line(position_data['evals'])
           acceptable_first_moves = self.get_all_pv_first_moves(position_data['evals'])
+          # NEW: also get cp for engine-best
+          best_move_uci, best_cp = self.get_best_move_and_cp(position_data['evals'])
+          
         except (KeyError, IndexError):
           batch_skipped_no_eval += 1
           continue
@@ -300,27 +324,60 @@ class LichessDPOGenerator:
         # Check ONLY the initial position (where we have PV data)
         # Get model's prediction for the initial position
         try:
-          model_move = self.predict_model_move(board)
+          model_move, win_probs = self.predict_model_move(board)
+          model_move_uci = model_move.uci()
+          
         except Exception as e:
           if batch_positions_processed <= 10:  # Debug first few positions
             print(f"    Error predicting move: {e}")
           continue
+                
+        best_index = np.argmax(win_probs)
+        model_win_prob = win_probs[best_index]
 
         # Only create preference pair if model's move is NOT in any PV
-        best_first_move = best_line[0]  # First move of best PV
-        if model_move.uci() not in acceptable_first_moves:
+        # best_first_move = best_line[0]  # First move of best PV
+        # diff_cp = self.find_move_cp(position_data['evals'], best_first_move - \
+        #   self.find_move_cp(position_data['evals'], model_move.uci()))
+                
+        if model_move_uci not in acceptable_first_moves:
+          # NEW: try to get cp for model's move from evals
+          model_cp = self.find_move_cp(position_data['evals'], model_move_uci)
+          
+          if model_cp is not None and best_cp is not None:
+            margin = self._cp_margin_for_side(best_cp, model_cp, board)
+          else:
+            #Handle what to do if the model move is not in the PV. 
+            white_prob = 1.0 / (1.0 + 10 ** (-best_cp / 400.0))
+            
+            if board.turn == chess.WHITE:
+              engine_prob_side = white_prob
+            else:
+              engine_prob_side = 1.0 - white_prob
+            
+            # 2) Probability margin in side-to-move space
+            prob_margin = engine_prob_side - model_win_prob        
+            
+            # 3) Scale to cp-like units WITHOUT forcing >= cp_margin
+            margin = prob_margin * 800.0    # can be small or negative            
+                        
+          # Enforce cp-based quality threshold
+          if margin < self.cp_margin:
+            batch_skipped_cp_margin += 1
+            continue            
+            
           batch_preferences.append(PreferencePair(
               position=board.fen(),
-              chosen_move=best_first_move,  # Best move (first PV)
-              rejected_move=model_move.uci(),
-              cp_diff=1.0
+              chosen_move=best_move_uci,  # Best move (first PV)
+              rejected_move=model_move_uci,
+              cp_diff=margin,              
           ))
           batch_pairs_from_lines += 1
 
         # Debug: Print first few comparisons
         if batch_positions_processed <= 5:
           print(f"    Pos {batch_positions_processed}: "
-                f"Best={best_first_move}, Model={model_move.uci()}, "
+                f"Best={best_move_uci}, Model={model_move.uci()}"
                 f"AllPVs={acceptable_first_moves}, InPVs={model_move.uci() in acceptable_first_moves}")
 
       # Stats for this batch
@@ -330,6 +387,7 @@ class LichessDPOGenerator:
           'batch_pairs': len(batch_preferences),
           'batch_skipped_gameover': batch_skipped_gameover,
           'batch_skipped_no_eval': batch_skipped_no_eval,
+          'batch_skipped_cp_margin': batch_skipped_cp_margin,  # NEW
           'total_positions': total_positions_processed,
           'total_pairs': total_pairs_generated,
       }
@@ -355,14 +413,15 @@ class LichessDPOGenerator:
   def _format_batch(
       self,
       preferences: list[PreferencePair],
-      batch_size: int,
+      batch_size: int,      
       stats: Optional[dict] = None
   ) -> tuple[list, list, list, dict]:
     """Convert preferences to training format."""
     positions_list = []
     chosen_moves_list = []
     rejected_moves_list = []
-
+    cp_diff_list = [] #Added
+        
     for pref in preferences:
       board = chess.Board(pref.position)
       tokenized = tokenizer.tokenize(board.fen()).astype(np.uint32)
@@ -370,7 +429,8 @@ class LichessDPOGenerator:
       positions_list.append(tokenized)
       chosen_moves_list.append(utils.MOVE_TO_ACTION[pref.chosen_move])
       rejected_moves_list.append(utils.MOVE_TO_ACTION[pref.rejected_move])
-
+      cp_diff_list.append(pref.cp_diff) #Added
+                
     # Shuffle for randomness
     indices = np.arange(len(preferences))
     np.random.shuffle(indices)
@@ -382,5 +442,6 @@ class LichessDPOGenerator:
       positions_batch = [positions_list[idx] for idx in batch_indices]
       chosen_batch = [chosen_moves_list[idx] for idx in batch_indices]
       rejected_batch = [rejected_moves_list[idx] for idx in batch_indices]
-
-      yield positions_batch, chosen_batch, rejected_batch, stats or {}
+      cp_diff_batch = [cp_diff_list[idx] for idx in batch_indices] #Added
+                
+      yield positions_batch, chosen_batch, rejected_batch, cp_diff_batch, stats or {}

@@ -29,6 +29,7 @@ def generate_dpo_pairs(
   all_positions = []
   all_chosen = []
   all_rejected = []
+  all_cp_diff = []
   cached_position_hashes = set()  # Track which positions we've already cached
   cache_complete = False
 
@@ -50,6 +51,7 @@ def generate_dpo_pairs(
           all_positions.append(pos_array)
           all_chosen.append(pair['chosen'])
           all_rejected.append(pair['rejected'])
+          all_cp_diff.append(pair['cp_diff'])
           cached_position_hashes.add(tuple(pair['position']))
 
       logging.info(f'Loaded {len(all_positions):,} cached DPO pairs')
@@ -67,6 +69,7 @@ def generate_dpo_pairs(
           all_positions.append(pos_array)
           all_chosen.append(pair['chosen'])
           all_rejected.append(pair['rejected'])
+          all_cp_diff.append(pair['cp_diff'])
           cached_position_hashes.add(tuple(pair['position']))
 
       logging.info(f'Loaded {len(all_positions):,} existing pairs')
@@ -113,12 +116,12 @@ def generate_dpo_pairs(
     last_save_count = pair_count
 
     try:
-      for positions_batch, chosen_batch, rejected_batch, stats in generator.generate_streaming_batches(
+      for positions_batch, chosen_batch, rejected_batch, cp_diff, stats in generator.generate_streaming_batches(
           positions_per_batch=10000,
           batch_size=32,
-          target_pairs=1_000_000_000,
+          target_pairs=1000,
       ):
-        for pos, chosen, rejected in zip(positions_batch, chosen_batch, rejected_batch):
+        for pos, chosen, rejected, cp_diff in zip(positions_batch, chosen_batch, rejected_batch, cp_diff):
           pos_hash = tuple(pos.tolist())
 
           # Skip if already cached
@@ -130,6 +133,7 @@ def generate_dpo_pairs(
           all_positions.append(pos)
           all_chosen.append(chosen)
           all_rejected.append(rejected)
+          all_cp_diff.append(cp_diff)
           cached_position_hashes.add(pos_hash)
 
           # Write to cache file immediately (JSONL format)
@@ -137,6 +141,7 @@ def generate_dpo_pairs(
               'position': pos.tolist(),
               'chosen': chosen,
               'rejected': rejected,
+              'cp_diff': cp_diff
           }
           cache_handle.write(json.dumps(pair_data) + '\n')
           pair_count += 1
@@ -198,7 +203,7 @@ if __name__ == '__main__':
     
     num_layers, embedding_dim, num_heads = 8, 256, 8 #Assume configuration for 9M
     base_model = '9M'
-    max_pairs = -1
+    max_pairs = 100 #Set to a small value for debugging purposes.
     lichess_db_path = '../data/lichess_db_eval.jsonl.zst'    
     
     #Setup predictor
